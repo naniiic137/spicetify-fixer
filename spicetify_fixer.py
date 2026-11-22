@@ -62,6 +62,7 @@ DOWNLOAD_PAGE = "https://www.spotify.com/download/windows/"
 SPICETIFY_INSTALLER = "https://raw.githubusercontent.com/spicetify/cli/main/install.ps1"
 MARKETPLACE_INSTALLER = "https://raw.githubusercontent.com/spicetify/marketplace/main/resources/install.ps1"
 SPICETIFY_LATEST_API = "https://api.github.com/repos/spicetify/cli/releases/latest"
+MARKETPLACE_LATEST_API = "https://api.github.com/repos/spicetify/marketplace/releases/latest"  # 22/11
 SHORTCUT_NAME = "Spotify (Spicetify fixed)"
 
 # Every Spicetify prompt is a "[y/N]" question read from stdin (cmd.go ReadAnswer). In v2.46.x the
@@ -93,6 +94,58 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 VERSION_RE = re.compile(r"\d+(?:\.\d+){1,3}")
 
 log = logging.getLogger("spicetify-fixer")
+
+
+# ---- colours in the console (22/11): cyan = a step, green = already fine, yellow = will be done / needs fixing,
+# red = a problem. Plain information keeps no colour. Off with --no-color, NO_COLOR, or when the output isn't a console.
+CYAN, GREEN, YELLOW, RED, BOLD, RESET = "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[1m", "\033[0m"
+_GREEN_WORDS = ("up to date", "is installed and enabled", ": present", "already", "done.", "patched and ready",
+                "nothing to do", "no fix needed", "looks right", "found the desktop spotify", "opened spotify", " ok")
+_YELLOW_WORDS = ("[check] would", "would run", "would start", "would open", "would switch", "would ask",
+                 "needs fixing", "will ", "updating", "switching", "installing", "patching", "out of date",
+                 "older than", "newer version", "plan would be", "re-patch", "not patched")
+_RED_WORDS = ("failed", "error", "could not", "timed out", "refuses", "not found", "missing")
+
+
+def color_for(message: str, level: int) -> str:
+    """The colour for one console line ('' = none)."""
+    text = message.lower()
+    if level >= logging.ERROR or any(w in text for w in _RED_WORDS):
+        return RED
+    if level >= logging.WARNING:
+        return YELLOW
+    if text.startswith("== step"):
+        return BOLD + CYAN
+    if any(w in text for w in _YELLOW_WORDS):
+        return YELLOW
+    if any(w in text for w in _GREEN_WORDS):
+        return GREEN
+    return ""
+
+
+class ColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        line = super().format(record)
+        c = color_for(record.getMessage(), record.levelno)
+        return f"{c}{line}{RESET}" if c and line.strip() else line
+
+
+def enable_colors(stream) -> bool:
+    """Turns on colours in a Windows console (virtual terminal mode). False: leave the text plain."""
+    if os.environ.get("NO_COLOR") or not getattr(stream, "isatty", lambda: False)():
+        return False
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        handle = k.GetStdHandle(-11)  # the console's output
+        mode = ctypes.c_uint32()
+        if not k.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        return bool(k.SetConsoleMode(handle, mode.value | 0x0004))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:  # noqa: BLE001 - colours are a nicety, never a failure
+        return False
 
 
 class FixerError(Exception):
@@ -513,6 +566,19 @@ def apps_state(folder: str) -> str:
     return "invalid"
 
 
+def marketplace_version(folder: str) -> tuple[int, ...] | None:
+    """The installed Marketplace's version, read from its extension.js ("Marketplace v1.0.8"), or None."""
+    path = os.path.join(folder, "extension.js")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.search(r'window\.Marketplace\s*=\s*\{[^}]*?version\s*:\s*"(\d+(?:\.\d+)+)"', text) or \
+        re.search(r"Marketplace v(\d+(?:\.\d+)+)", text)
+    return parse_version(m.group(1)) if m else None
+
+
 def backup_state(backup_dir: str, backup_version: str, current_version: tuple[int, ...] | None) -> str:
     """Same idea as Spicetify's backupstatus.Get(): 'empty', 'backed' (matches Spotify) or 'outdated'."""
     try:
@@ -758,46 +824,26 @@ class Fixer:
         if self.desktop:
             log.info("  Both builds are installed; the desktop one is used and patched.")
             return
-        log.info("  Why it keeps breaking:")
-        log.info("   1. The Microsoft Store updates Spotify by itself and replaces its folder in WindowsApps.")
-        log.info("   2. Each update moves Spotify and throws Spicetify's patch away, so you have to re-run it.")
-        log.info("   3. Spicetify only partly supports the Store build; its own guide says to use the desktop installer.")
         if not self.decide_switch():
-            log.info("  Keeping the Store version. Spicetify is re-applied on every run of this tool.")
+            log.info("  Keeping the Store Spotify and your login; it is patched in place.")
+            log.info("  The Store replaces Spotify when it updates, which removes the patch: open Spotify with this")
+            log.info("  tool (or its shortcut) and it re-patches only when needed. --switch-to-desktop moves to the")
+            log.info("  desktop Spotify instead (that one needs a new login once).")
             return
         self.switch_to_desktop()
 
     def decide_switch(self) -> bool:
-        remembered = self.state.get("store_switch")
-        if self.args.never_switch:
-            log.info("  --never-switch: keeping the Store version and not asking again.")
-            if not self.check:
-                self.state["store_switch"] = "no"
-                save_state(self.paths.state_file, self.state)
-            return False
+        """22/11 (the owner): with the Store Spotify, keep it and its login and just patch it. Switch to the
+        desktop Spotify only with --switch-to-desktop (or to finish a switch that was started and cut off)."""
         if self.args.switch_to_desktop:
-            log.info("  --switch-to-desktop: switching without asking.")
+            log.info("  --switch-to-desktop: moving to the desktop Spotify (you log in once there).")
+            if self.check:
+                log.info("  [check] WOULD switch to the desktop Spotify.")
             return True
-        if remembered == "no":
-            log.info("  You chose to keep the Store version earlier (run with --switch-to-desktop to switch).")
-            return False
-        if remembered == "yes":
-            log.info("  You already said yes to the switch earlier; finishing it now.")
+        if self.state.get("store_switch") == "started":
+            log.info("  A switch to the desktop Spotify was started earlier and cut off; finishing it now.")
             return True
-        question = ("Switch to the desktop Spotify now? Your downloads/login may need redoing.\n"
-                    "(It takes a few minutes; Spotify opens when it is done.)")
-        if self.check:
-            log.info("  [check] WOULD ask once: \"Switch to the desktop Spotify now? Your downloads/login "
-                     "may need redoing [Y/n]\"  (the rest of this report assumes Yes)")
-            return True
-        answer = ask_yes_no(question, default_yes=True)
-        if answer is None:
-            log.info("  Could not ask the question (no console); keeping the Store version for now.")
-            return False
-        self.state["store_switch"] = "yes" if answer else "no"
-        save_state(self.paths.state_file, self.state)
-        log.info("  Answer: %s (remembered in %s)", "yes" if answer else "no", self.paths.state_file)
-        return answer
+        return False
 
     def require_installable(self) -> None:
         """Checks done BEFORE anything is removed, so a failure can never leave you without Spotify."""
@@ -814,6 +860,9 @@ class Fixer:
 
     def switch_to_desktop(self) -> None:
         self.require_installable()
+        if not self.check:  # remembered, so a switch cut off half-way is finished on the next run
+            self.state["store_switch"] = "started"
+            save_state(self.paths.state_file, self.state)
         self.close_spotify()
         log.info("  Removing the Microsoft Store Spotify (current user only)...")
         res = self.runner.run(powershell(f"Get-AppxPackage {STORE_PACKAGE} | Remove-AppxPackage"),
@@ -824,6 +873,9 @@ class Fixer:
                              "You can remove it in Settings > Apps, then run this tool again.")
         self.original_store, self.store = self.store, None
         self.install_desktop(reason="Installing the desktop Spotify with winget (a few minutes)...")
+        if not self.check:
+            self.state["store_switch"] = "done"
+            save_state(self.paths.state_file, self.state)
         if self.check:
             self.simulated_switch = True
         else:
@@ -942,6 +994,16 @@ class Fixer:
         try:
             req = urllib.request.Request(SPICETIFY_LATEST_API, headers={"User-Agent": "spicetify-fixer",
                                                                         "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return parse_version(json.loads(resp.read().decode("utf-8")).get("tag_name", ""))
+        except (OSError, ValueError):
+            return None
+
+    def latest_marketplace(self) -> tuple[int, ...] | None:
+        """Read the newest Marketplace version from GitHub (read-only, 15 s limit)."""
+        try:
+            req = urllib.request.Request(MARKETPLACE_LATEST_API, headers={"User-Agent": "spicetify-fixer",
+                                                                          "Accept": "application/vnd.github+json"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return parse_version(json.loads(resp.read().decode("utf-8")).get("tag_name", ""))
         except (OSError, ValueError):
@@ -1145,9 +1207,27 @@ class Fixer:
         log.info("  custom_apps = %s | folder %s: %s", "|".join(apps) or "(empty)", folder,
                  "present" if present else "missing")
         if enabled and present:
-            log.info("  Marketplace is installed and enabled.")
-            return
-        log.info("  Installing the Marketplace with its official installer (%s).", MARKETPLACE_INSTALLER)
+            have = marketplace_version(folder)
+            if self.args.skip_marketplace_update:
+                log.info("  Marketplace %s is installed and enabled (update skipped: --skip-marketplace-update).",
+                         "v" + version_text(have[:3]) if have else "")
+                return
+            newest = self.latest_marketplace()
+            if newest is None or have is None or compare_versions(have, newest) >= 0:
+                if newest is None:
+                    log.info("  Marketplace %s is installed and enabled (couldn't reach GitHub to look for a newer one).",
+                             "v" + version_text(have[:3]) if have else "")
+                elif have is None:
+                    log.info("  Marketplace is installed and enabled (its version isn't written in its files; "
+                             "newest is v%s).", version_text(newest[:3]))
+                else:
+                    log.info("  Marketplace v%s is installed and enabled. Up to date (newest is v%s).",
+                             version_text(have[:3]), version_text(newest[:3]))
+                return
+            log.info("  Marketplace v%s is older than v%s: updating it with its official installer.",
+                     version_text(have[:3]), version_text(newest[:3]))
+        else:
+            log.info("  Installing the Marketplace with its official installer (%s).", MARKETPLACE_INSTALLER)
         bypass = " -BypassAdmin" if self.admin else ""
         script = f"& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing '{MARKETPLACE_INSTALLER}').Content)){bypass}"
         self.close_spotify()
@@ -1164,7 +1244,8 @@ class Fixer:
         plan = decide_patch(self.patch_state())
         if plan == REINSTALL or not self.run_plan(plan):
             raise FixerError("The Marketplace is installed but applying it failed (details in the log).")
-        log.info("  Marketplace installed and applied.")
+        now = marketplace_version(folder)
+        log.info("  Marketplace %sinstalled and applied.", f"v{version_text(now[:3])} " if now else "")
 
     # ---------- step 8 ----------
 
@@ -1271,18 +1352,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-launch", action="store_true", help="do not open Spotify at the end")
     p.add_argument("--no-pause", action="store_true", help="on failure, do not keep the window open")
     p.add_argument("--verbose", action="store_true", help="show every command's output in the console")
+    p.add_argument("--skip-marketplace-update", action="store_true", help="don't update the Marketplace")
+    p.add_argument("--no-color", action="store_true", help="plain text in the console (no green / yellow / red)")
     p.add_argument("--version", action="version", version=f"spicetify-fixer {__version__}")
     return p
 
 
-def setup_logging(paths: Paths, verbose: bool) -> str:
+def setup_logging(paths: Paths, verbose: bool, color: bool = True) -> str:
     log.setLevel(logging.DEBUG)
     log.handlers.clear()
     log.propagate = False
     if sys.stdout is not None:
         console = logging.StreamHandler(sys.stdout)
         console.setLevel(logging.DEBUG if verbose else logging.INFO)
-        console.setFormatter(logging.Formatter("%(message)s"))
+        use_color = color and enable_colors(sys.stdout)
+        console.setFormatter(ColorFormatter("%(message)s") if use_color else logging.Formatter("%(message)s"))
         log.addHandler(console)
     try:
         os.makedirs(paths.fixer_dir, exist_ok=True)
@@ -1317,7 +1401,7 @@ def main(argv: list[str] | None = None, *, paths: Paths | None = None, runner: R
     if args.switch_to_desktop and args.never_switch:
         build_parser().error("--switch-to-desktop and --never-switch cannot be used together")
     paths = paths or Paths.from_env()
-    log_path = setup_logging(paths, args.verbose)
+    log_path = setup_logging(paths, args.verbose, color=not args.no_color)
     runner = runner or Runner(check=args.check)
     fixer = Fixer(args=args, paths=paths, runner=runner,
                   admin=is_admin() if admin is None else admin, state=load_state(paths.state_file))

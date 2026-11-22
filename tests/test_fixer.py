@@ -130,6 +130,7 @@ class FakePC(unittest.TestCase):
             mock.patch.object(sf.webbrowser, "open"),
             mock.patch.object(sf, "get_file_version", return_value=None),
             mock.patch.object(sf, "ask_yes_no", return_value=True),
+            mock.patch.object(sf.Fixer, "latest_marketplace", return_value=(1, 0, 12, 0)),  # never the real GitHub
         ]
         self.mocks = [p.start() for p in self.patches]
         self.start_process = self.mocks[2]
@@ -457,6 +458,55 @@ class TestAnswers(FakePC):
         self.assertTrue([c for c in runner.executed if c["cmd"][1:] == ["apply", "-n"]])
 
 
+    # ---- 22/11: the Marketplace is updated too
+    def market_dir(self):
+        return os.path.join(self.paths.spicetify_userdata, "CustomApps", "marketplace")
+
+    def market_fixer(self, version, extra=(), **kw):
+        write(os.path.join(self.market_dir(), "extension.js"),
+              f'console.log("Marketplace v{version}"),window.Marketplace={{reset:Kr,export:qr,version:"{version}"}};')
+
+        def installed(cmd):
+            write(os.path.join(self.market_dir(), "index.js"))
+            write(os.path.join(self.market_dir(), "extension.js"), 'window.Marketplace={reset:a,version:"1.0.12"};')
+            return sf.Result(0, "Done!")
+
+        runner = FakeRunner(responses=self.responses(extra=[("marketplace/main/resources/install.ps1", installed), *extra]))
+        fixer = self.fixer(runner, state={"store_switch": "no"}, **kw)
+        fixer.find_spotify()
+        fixer.spicetify = self.paths.spicetify_exe
+        fixer.spicetify_version = "2.46.7"
+        return fixer, runner
+
+    def test_marketplace_version_is_read_from_its_files(self):
+        write(os.path.join(self.market_dir(), "extension.js"), 'x;window.Marketplace={reset:Kr,export:qr,version:"1.0.8"};y')
+        self.assertEqual(sf.marketplace_version(self.market_dir()), (1, 0, 8, 0))
+        write(os.path.join(self.market_dir(), "extension.js"), 'console.log("Marketplace v1.0.9")')
+        self.assertEqual(sf.marketplace_version(self.market_dir()), (1, 0, 9, 0))
+        os.remove(os.path.join(self.market_dir(), "extension.js"))
+        self.assertIsNone(sf.marketplace_version(self.market_dir()))
+
+    def test_an_older_marketplace_is_updated(self):
+        fixer, runner = self.market_fixer("1.0.8")
+        fixer.marketplace()
+        self.assertTrue(runner.find("marketplace/main/resources/install.ps1"))
+        self.assertEqual(sf.marketplace_version(self.market_dir()), (1, 0, 12, 0))
+
+    def test_an_up_to_date_marketplace_is_left_alone(self):
+        fixer, runner = self.market_fixer("1.0.12")
+        fixer.marketplace()
+        self.assertFalse(runner.find("marketplace/main/resources/install.ps1"))
+
+    def test_marketplace_update_can_be_skipped_or_github_unreachable(self):
+        fixer, runner = self.market_fixer("1.0.8", skip_marketplace_update=True)
+        fixer.marketplace()
+        self.assertFalse(runner.find("marketplace/main/resources/install.ps1"))
+        fixer, runner = self.market_fixer("1.0.8")
+        with mock.patch.object(sf.Fixer, "latest_marketplace", return_value=None):
+            fixer.marketplace()
+        self.assertFalse(runner.find("marketplace/main/resources/install.ps1"))
+
+
 class TestStateFile(FakePC):
     def test_round_trip_and_damaged_file(self):
         sf.save_state(self.paths.state_file, {"store_switch": "no"})
@@ -465,26 +515,35 @@ class TestStateFile(FakePC):
         self.assertEqual(sf.load_state(self.paths.state_file), {})
         self.assertEqual(sf.load_state(os.path.join(self.tmp.name, "none.json")), {})
 
-    def test_answer_is_remembered_and_never_asked_again(self):
-        self.ask.return_value = False
-        fixer = self.fixer(FakeRunner(responses=self.responses()))
+    def test_store_is_kept_by_default_never_asks(self):
+        # 22/11 (the owner): with the Store Spotify, keep it (and its login) and just patch it
+        runner = FakeRunner(responses=self.responses())
+        fixer = self.fixer(runner)
         fixer.find_spotify()
         fixer.store_switch()
-        self.assertEqual(self.ask.call_count, 1)
-        self.assertEqual(sf.load_state(self.paths.state_file)["store_switch"], "no")
-        again = self.fixer(FakeRunner(responses=self.responses()), state=sf.load_state(self.paths.state_file))
-        again.find_spotify()
-        again.store_switch()
-        self.assertEqual(self.ask.call_count, 1)  # not asked a second time
+        self.ask.assert_not_called()
+        self.assertFalse(runner.find("Remove-AppxPackage"))
+        self.assertFalse(runner.find("winget install"))
+        self.assertIsNotNone(fixer.store)
 
-    def test_never_switch_flag(self):
+    def test_never_switch_flag_still_accepted(self):
         runner = FakeRunner(responses=self.responses())
         fixer = self.fixer(runner, never_switch=True)
         fixer.find_spotify()
         fixer.store_switch()
-        self.ask.assert_not_called()
-        self.assertEqual(sf.load_state(self.paths.state_file)["store_switch"], "no")
         self.assertFalse(runner.find("Remove-AppxPackage"))
+
+    def test_a_switch_cut_off_is_finished(self):
+        def installed(cmd):
+            self.make_desktop()
+            return sf.Result(0, "Successfully installed")
+
+        runner = FakeRunner(responses=self.responses(extra=[("winget install", installed)]))
+        fixer = self.fixer(runner, state={"store_switch": "started"})
+        fixer.find_spotify()
+        fixer.store_switch()
+        self.assertTrue(runner.find("Remove-AppxPackage"))
+        self.assertEqual(sf.load_state(self.paths.state_file)["store_switch"], "done")
 
     def test_switch_flag_skips_question_and_overrides_no(self):
         def installed(cmd):
@@ -542,16 +601,22 @@ class TestCheckMode(FakePC):
         self.ask.assert_not_called()
 
     def test_check_reports_the_plan(self):
+        # 22/11 (the owner): the Store Spotify is kept with its login and only patched
         code, out, runner = self.run_main()
         self.assertIn("Found the Microsoft Store Spotify", out)
+        self.assertIn("Keeping the Store Spotify and your login", out)
+        self.assertNotIn("Remove-AppxPackage", out)
+        self.assertFalse(runner.find("Remove-AppxPackage"))
+        self.assertFalse(runner.find("winget install"))
+        self.assertIn("WOULD start", out)
+
+    def test_check_with_switch_flag_reports_the_switch(self):
+        code, out, runner = self.run_main("--switch-to-desktop")
         self.assertIn("spotify_path points at the Store package", out)
-        self.assertIn("WOULD ask once", out)
         self.assertIn("WOULD run: Get-AppxPackage SpotifyAB.SpotifyMusic | Remove-AppxPackage", out)
         self.assertIn("WOULD run: winget install", out)
         self.assertIn("WOULD run: spicetify backup apply -n", out)
-        self.assertIn("WOULD start", out)
-        # The changing commands were still recorded, just not executed.
-        self.assertTrue(runner.find("Remove-AppxPackage"))
+        self.assertTrue(runner.find("Remove-AppxPackage"))  # recorded, not executed
 
     def test_check_with_shortcut(self):
         code, out, runner = self.run_main("--make-shortcut")
@@ -620,3 +685,35 @@ class TestCommandLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ColorTests(unittest.TestCase):
+    """22/11: colours by meaning (cyan step, green fine, yellow to do, red problem, none for plain lines)."""
+
+    def test_colors_by_meaning(self):
+        info, warn, err = logging.INFO, logging.WARNING, logging.ERROR
+        self.assertEqual(sf.color_for("== Step 1: Find Spotify", info), sf.BOLD + sf.CYAN)
+        self.assertEqual(sf.color_for("  Up to date (newest is 2.46.7).", info), sf.GREEN)
+        self.assertEqual(sf.color_for("  Marketplace is installed and enabled.", info), sf.GREEN)
+        self.assertEqual(sf.color_for("  [check] WOULD run: spicetify backup apply -n", info), sf.YELLOW)
+        self.assertEqual(sf.color_for("  Needs fixing: spotify_path points at the Store package", info), sf.YELLOW)
+        self.assertEqual(sf.color_for("  WARNING: running as administrator", warn), sf.YELLOW)
+        self.assertEqual(sf.color_for("FAILED: winget could not install Spotify", err), sf.RED)
+        self.assertEqual(sf.color_for("  timed out after 60s: winget", warn), sf.RED)
+        self.assertEqual(sf.color_for("  spotify_path = C:/somewhere", info), "")
+        self.assertEqual(sf.color_for("", info), "")
+
+    def test_formatter_and_switch_off(self):
+        fmt = sf.ColorFormatter("%(message)s")
+        rec = logging.LogRecord("x", logging.INFO, __file__, 1, "  Up to date", None, None)
+        self.assertEqual(fmt.format(rec), sf.GREEN + "  Up to date" + sf.RESET)
+        plain = logging.LogRecord("x", logging.INFO, __file__, 1, "  spotify_path = x", None, None)
+        self.assertEqual(fmt.format(plain), "  spotify_path = x")
+
+        class NotATty:
+            def isatty(self):
+                return False
+
+        self.assertFalse(sf.enable_colors(NotATty()))
+        with mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(sf.enable_colors(sys.stdout))
